@@ -10,6 +10,14 @@ on:
         description: '编入 ReSukiSU + SuSFS（同时开启/关闭，默认开启）'
         type: boolean
         default: true
+      ksu_ref:
+        description: 'KernelSU 子模块钉的 ref（tools/patches/resukisu-4.4.patch 是按它写的，留空=默认）'
+        type: string
+        default: 'f532f18c2198a9210c87d368a57e985786be03ee'
+      bootimg_vndk28:
+        description: '同时用底包(VNDK28) config/dtb/ramdisk 打一个能直接刷 boot 分区的 boot.img'
+        type: boolean
+        default: true
 
 jobs:
   build:
@@ -316,3 +324,149 @@ jobs:
           > \`${URL}\`
           EOF
           echo "TEMP_URL=${URL}"
+
+  # ==========================================================================
+  # DW99（SL8541E + VNDK28 底包 vendor + GSI）用的可刷 boot.img
+  # 参考 sl8541e-kernel-builder：
+  #   * config 用从设备底包内核提取的 configs/dw99-4.4.147-vndk28.config
+  #     （用它自带的 defconfig 会直接进 fastboot）
+  #   * 必须 CONFIG_MODULE_FORCE_LOAD=y：4.4 的 check_modinfo() 在
+  #     MODULE_INIT_IGNORE_VERMAGIC 下会调 try_to_force_load()，没开这个
+  #     会静默返回 -ENOEXEC，所有 .ko（含自己编的）都加载不了 -> 黑屏
+  #   * patches/001-ignore-module-version.patch 强制忽略 vermagic/modversions
+  #   * dtb/ramdisk/header 全部用底包那份（prebuilt/vndk28/）
+  #   * 新编的 mali/sprdwl_ng/... 直接注入 ramdisk
+  # ==========================================================================
+  bootimg:
+    if: github.event_name == 'workflow_dispatch' && inputs.bootimg_vndk28
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    env:
+      CCACHE_DIR: /home/runner/.ccache
+      CCACHE_MAXSIZE: 4G
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+      CCACHE_NOCOMPRESS: "true"
+      CCACHE_SLOPPINESS: "time_macros,include_file_mtime,include_file_ctime,file_stat_matches"
+      CCACHE_COMPILERCHECK: "content"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Pin ReSukiSU submodule + apply its 4.4 patch
+        run: |
+          if git -C KernelSU rev-parse --is-shallow-repository 2>/dev/null | grep -q true; then
+            git -C KernelSU fetch --unshallow origin
+          fi
+          KSU_REF="${{ inputs.ksu_ref }}"
+          [ -n "$KSU_REF" ] || KSU_REF=f532f18c2198a9210c87d368a57e985786be03ee
+          git -C KernelSU fetch origin "$KSU_REF" 2>/dev/null || true
+          git -C KernelSU checkout --detach "$KSU_REF"
+          git -C KernelSU log -1 --format='ReSukiSU HEAD: %h %s'
+          git -C KernelSU apply --whitespace=nowarn ../tools/patches/resukisu-4.4.patch
+
+      - name: Apply local kernel patches
+        run: |
+          for p in "$GITHUB_WORKSPACE"/patches/*.patch; do
+            [ -f "$p" ] || continue
+            echo "::group::本地补丁 $(basename "$p")"
+            patch -p1 -N --fuzz=3 -r - < "$p"
+            echo "::endgroup::"
+          done
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu flex bison bc \
+              libssl-dev libelf-dev ccache cpio xz-utils python3
+          aarch64-linux-gnu-gcc --version | head -1
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-dw99-bootimg-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ runner.os }}-dw99-bootimg-
+            ccache-${{ runner.os }}-kernel-
+
+      - name: Setup ccache
+        run: |
+          mkdir -p ~/.ccache
+          ccache -M 4G
+          ccache -z
+          ccache -p | grep -E "cache_dir|max_size" || true
+
+      - name: Configure (底包 config + FORCE_LOAD)
+        run: |
+          cp configs/dw99-4.4.147-vndk28.config .config
+          scripts/config --enable CONFIG_MODULE_FORCE_LOAD
+          scripts/config --enable CONFIG_KSU
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          echo "--- 关键配置 ---"
+          grep -E "^CONFIG_(LOCALVERSION=|MODULES=|MODVERSIONS=|MODULE_FORCE_LOAD=|KSU=|PSTORE_RAM=)" .config
+          echo "kernelrelease = '$(make -s ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- kernelrelease)'"
+
+      - name: Build Image
+        run: |
+          set -o pipefail
+          make ARCH=arm64 CROSS_COMPILE="ccache aarch64-linux-gnu-" -j"$(nproc)" Image 2>&1 | tee build-image.log
+          ls -la arch/arm64/boot/Image
+          strings arch/arm64/boot/Image | grep -m1 'Linux version'
+
+      - name: Build modules + inject into ramdisk
+        run: |
+          set +e
+          make ARCH=arm64 CROSS_COMPILE="ccache aarch64-linux-gnu-" -j"$(nproc)" modules 2>&1 | tee build-modules.log
+          rm -rf inst mods
+          make ARCH=arm64 CROSS_COMPILE="ccache aarch64-linux-gnu-" modules_install INSTALL_MOD_PATH="$PWD/inst"
+          mkdir -p mods/lib/modules
+          for m in mali.ko sprdwl_ng.ko sprdbt_tty.ko sprd_fm.ko; do
+            f="$(find inst -name "$m" 2>/dev/null | head -1)"
+            if [ -n "$f" ]; then
+              cp "$f" mods/lib/modules/$m
+              echo "把新编的 $m 注入 ramdisk"
+            else
+              echo "!! 没编出 $m（用底包 ramdisk 里那份，靠 FORCE_LOAD 忽略版本）"
+            fi
+          done
+
+      - name: Repack boot.img (底包 header/ramdisk/dtb)
+        run: |
+          args=(--header prebuilt/header.bin
+                --kernel arch/arm64/boot/Image
+                --ramdisk prebuilt/vndk28/ramdisk.gz
+                --dt prebuilt/vndk28/dt.bin
+                --device-tree-size-field
+                --pad-to 36700160)
+          if [ -n "$(ls -A mods/lib/modules 2>/dev/null)" ]; then
+            args+=(--replace-dir mods)
+          fi
+          python3 scripts/boot_repack.py "${args[@]}" --out boot-wgki-dw99-vndk28.img
+          ls -la boot-wgki-dw99-vndk28.img
+          md5sum boot-wgki-dw99-vndk28.img
+
+      - name: Upload boot.img
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-wgki-dw99-vndk28
+          path: |
+            boot-wgki-dw99-vndk28.img
+            arch/arm64/boot/Image
+            build-image.log
+            build-modules.log
+            .config
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s || true
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-dw99-bootimg-${{ github.run_id }}
