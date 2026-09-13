@@ -18,6 +18,14 @@ on:
         description: '同时用底包(VNDK28) config/dtb/ramdisk 打一个能直接刷 boot 分区的 boot.img'
         type: boolean
         default: true
+      extra_config:
+        description: 'bootimg job 追加配置：每行一条 scripts/config 参数（如 "--enable CONFIG_SC23XX"），留空=不加'
+        type: string
+        default: ''
+      out_name:
+        description: 'bootimg 产物文件名/artifact 名（默认 boot-wgki-dw99-vndk28）'
+        type: string
+        default: 'boot-wgki-dw99-vndk28'
 
 jobs:
   build:
@@ -416,10 +424,23 @@ jobs:
           ccache -p | grep -E "cache_dir|max_size" || true
 
       - name: Configure (底包 config + FORCE_LOAD)
+        env:
+          EXTRA_CONFIG: ${{ inputs.extra_config }}
         run: |
           cp configs/dw99-4.4.147-vndk28.config .config
           scripts/config --enable CONFIG_MODULE_FORCE_LOAD
           scripts/config --enable CONFIG_KSU
+          : > extra_config.txt
+          if [ -n "$EXTRA_CONFIG" ]; then
+            echo "::group::追加配置 (extra_config)"
+            printf '%s\n' "$EXTRA_CONFIG" > extra_config.txt
+            while IFS= read -r line; do
+              case "$line" in ''|'#'*) continue;; esac
+              echo "+ scripts/config $line"
+              scripts/config $line
+            done < extra_config.txt
+            echo "::endgroup::"
+          fi
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
           echo "--- 关键配置 ---"
           grep -E "^CONFIG_(LOCALVERSION=|MODULES=|MODVERSIONS=|MODULE_FORCE_LOAD=|KSU=|PSTORE_RAM=)" .config
@@ -451,6 +472,7 @@ jobs:
 
       - name: Repack boot.img (底包 header/ramdisk/dtb)
         run: |
+          OUT="${{ inputs.out_name || 'boot-wgki-dw99-vndk28' }}"
           args=(--header prebuilt/header.bin
                 --kernel arch/arm64/boot/Image
                 --ramdisk prebuilt/vndk28/ramdisk.gz
@@ -460,20 +482,21 @@ jobs:
           if [ -n "$(ls -A mods/lib/modules 2>/dev/null)" ]; then
             args+=(--replace-dir mods)
           fi
-          python3 scripts/boot_repack.py "${args[@]}" --out boot-wgki-dw99-vndk28.img
-          ls -la boot-wgki-dw99-vndk28.img
-          md5sum boot-wgki-dw99-vndk28.img
+          python3 scripts/boot_repack.py "${args[@]}" --out "${OUT}.img"
+          ls -la "${OUT}.img"
+          md5sum "${OUT}.img"
 
       - name: Upload boot.img
         uses: actions/upload-artifact@v4
         with:
-          name: boot-wgki-dw99-vndk28
+          name: ${{ inputs.out_name || 'boot-wgki-dw99-vndk28' }}
           path: |
-            boot-wgki-dw99-vndk28.img
+            ${{ inputs.out_name || 'boot-wgki-dw99-vndk28' }}.img
             arch/arm64/boot/Image
             build-image.log
             build-modules.log
             .config
+            extra_config.txt
 
       - name: ccache stats
         if: always()
