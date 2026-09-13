@@ -26,6 +26,10 @@ on:
         description: 'bootimg 产物文件名/artifact 名（默认 boot-wgki-dw99-vndk28）'
         type: string
         default: 'boot-wgki-dw99-vndk28'
+      base_config:
+        description: 'bootimg job 的基准 config 文件（默认底包 config；可换成 configs/routeA-*.config 做二分）'
+        type: string
+        default: 'configs/dw99-4.4.147-vndk28.config'
 
 jobs:
   build:
@@ -426,8 +430,11 @@ jobs:
       - name: Configure (底包 config + FORCE_LOAD)
         env:
           EXTRA_CONFIG: ${{ inputs.extra_config }}
+          BASE_CONFIG: ${{ inputs.base_config }}
         run: |
-          cp configs/dw99-4.4.147-vndk28.config .config
+          BASE="${BASE_CONFIG:-configs/dw99-4.4.147-vndk28.config}"
+          echo "基准 config: $BASE"
+          cp "$BASE" .config
           scripts/config --enable CONFIG_MODULE_FORCE_LOAD
           scripts/config --enable CONFIG_KSU
           : > extra_config.txt
