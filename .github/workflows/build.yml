@@ -79,8 +79,12 @@ jobs:
           if git -C KernelSU rev-parse --is-shallow-repository 2>/dev/null | grep -q true; then
             git -C KernelSU fetch --unshallow origin
           fi
-          git -C KernelSU fetch origin main
-          git -C KernelSU checkout --detach origin/main
+          # 钉住补丁对应的提交：上游 main 已经飘了，直接跟 main
+          # tools/patches/resukisu-4.4.patch 会打不上（apply 失败）
+          KSU_REF="${{ inputs.ksu_ref }}"
+          [ -n "$KSU_REF" ] || KSU_REF=f532f18c2198a9210c87d368a57e985786be03ee
+          git -C KernelSU fetch origin "$KSU_REF" 2>/dev/null || true
+          git -C KernelSU checkout --detach "$KSU_REF"
           echo "ReSukiSU HEAD: $(git -C KernelSU log -1 --format='%h %s')"
 
       - name: Apply ReSukiSU 4.4 customizations
@@ -90,6 +94,14 @@ jobs:
           git -C KernelSU apply --whitespace=nowarn ../tools/patches/resukisu-4.4.patch
           echo "✅ ReSukiSU 4.4 patch applied"
           grep -n "CONFIG_KSU_MANUAL_HOOK" KernelSU/kernel/Kconfig | head -2
+
+      - name: Integrate KernelSU into the tree
+        run: |
+          # drivers/Kconfig 里 source "drivers/kernelsu/Kconfig"、drivers/Makefile 里
+          # obj-$(CONFIG_KSU) += kernelsu/ —— 这个目录必须指向子模块，
+          # 仓库里没有，不建的话 kconfig 直接报 "can't open file drivers/kernelsu/Kconfig"
+          ln -sfn ../KernelSU/kernel drivers/kernelsu
+          ls -la drivers/kernelsu/ | head -3
 
       - name: Install dependencies
         run: |
@@ -367,6 +379,9 @@ jobs:
           git -C KernelSU checkout --detach "$KSU_REF"
           git -C KernelSU log -1 --format='ReSukiSU HEAD: %h %s'
           git -C KernelSU apply --whitespace=nowarn ../tools/patches/resukisu-4.4.patch
+          # 同上：把子模块挂进内核树（drivers/kernelsu -> KernelSU/kernel）
+          ln -sfn ../KernelSU/kernel drivers/kernelsu
+          ls -la drivers/kernelsu/ | head -3
 
       - name: Apply local kernel patches
         run: |
